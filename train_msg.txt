@@ -1,0 +1,16 @@
+test none n
+test ground_truth n
+test candidates n
+test overlap n
+test none y
+test ground_truth y
+test candidates y
+test overlap y
+train none n
+train ground_truth n
+train candidates n
+train overlap n
+train none y
+train ground_truth y
+train candidates y
+train overlap y

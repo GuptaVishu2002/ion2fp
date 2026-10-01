@@ -28,6 +28,8 @@ class FingerprintLightningModule(pl.LightningModule):
         return pred, loss
 
     def training_step(self, batch, batch_idx):
+        if batch["mzs"].shape[0] < 2:
+            return None
         _, loss = self._step(batch)
         self.log("train_loss", loss, on_step=False, on_epoch=True, batch_size=batch["mzs"].shape[0])
         return loss

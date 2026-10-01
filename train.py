@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 
@@ -45,8 +46,13 @@ def build_arg_parser():
     parser.add_argument("--augmentation_file", type=str, default=None)
     parser.add_argument("--augmentation_dir", type=str,default="/Genomics/skinniderlab/msms-triangulation/spectra/spectraverse/aug_fragnet/formula")
     parser.add_argument("--augmentation_splits", type=int, default=10)
+    parser.add_argument("--augmentation_folds", type=int, default=10)
+    parser.add_argument("--augmentation_source", type=str, default="test", choices=["test", "train"])
+    parser.add_argument("--augmentation_exclude", type=str, default="none", choices=["none", "ground_truth", "candidates", "overlap"])
+    parser.add_argument("--augmentation_candidates", type=str, default=None)
+    parser.add_argument("--augmentation_only", type=lambda v: str(v).lower() in ("y", "yes", "true", "1"), default=False)
     parser.add_argument("--shuffle_buffer", type=int, default=20000)
-    parser.add_argument("--augmentation_resample_every_epoch",type=lambda v: str(v).lower() in ("y", "yes", "true", "1"), default=True)
+    parser.add_argument("--augmentation_resample_every_epoch",type=lambda v: str(v).lower() in ("y", "yes", "true", "1"), default=False)
 
     default_hp = Hyperparams()
     for f in fields(default_hp):
@@ -81,6 +87,8 @@ def main():
         raise ValueError("need fold info in --input to use augmentation_multiplier, unless you pass --augmentation_file")
     if args.augmentation_multiplier < 0:
         raise ValueError(f"--augmentation_multiplier must be >= 0, got {args.augmentation_multiplier}")
+    if args.augmentation_only and args.augmentation_multiplier == 1:
+        raise ValueError("--augmentation_only needs --augmentation_multiplier other than 1, otherwise there's no training data at all")
 
     if has_fold:
         val_fold = [v.strip() for v in args.val_fold.split(",")]
@@ -94,21 +102,66 @@ def main():
         val_set = Subset(dataset, val_idx)
 
         if args.augmentation_multiplier != 1:
+            smiles_test = {dataset.items[i]["smiles"] for i in test_idx}
+            smiles_train = {dataset.items[i]["smiles"] for i in train_idx}
+            source_smiles = smiles_test if args.augmentation_source == "test" else smiles_train
+            opposite_smiles = smiles_train if args.augmentation_source == "test" else smiles_test
+
+            if args.augmentation_exclude == "none":
+                smiles_exclude = None
+            elif args.augmentation_exclude == "ground_truth":
+                smiles_exclude = source_smiles
+            else:
+                if not args.augmentation_candidates:
+                    raise ValueError("--augmentation_exclude candidates/overlap needs --augmentation_candidates to point at a candidates json file")
+                print(f"loading candidates from {args.augmentation_candidates}")
+                with open(args.augmentation_candidates) as f:
+                    candidates_json = json.load(f)
+                candidate_union = set()
+                for smiles in source_smiles:
+                    candidate_union.update(candidates_json.get(smiles, []))
+                print(f"found candidates for {sum(1 for s in source_smiles if s in candidates_json)}/{len(source_smiles)} source smiles, {len(candidate_union)} unique candidate smiles total")
+                if args.augmentation_exclude == "candidates":
+                    smiles_exclude = candidate_union
+                else:
+                    smiles_exclude = candidate_union & opposite_smiles
+            print(f"augmentation source is {args.augmentation_source}, excluding {args.augmentation_exclude} ({len(smiles_exclude) if smiles_exclude is not None else 0} smiles)")
+
             if args.augmentation_file:
                 aug_files = [Path(args.augmentation_file)]
                 if not aug_files[0].is_file():
                     raise FileNotFoundError(f"--augmentation_file does not exist: {aug_files[0]}")
-                fold_filter = None
+                if args.augmentation_source == "test":
+                    if len(test_fold) != 1:
+                        raise ValueError(f"need just one --test_fold value for augmentation, got {args.test_fold!r}")
+                    keep_folds = {canonical_fold(test_fold[0])}
+                    fold_filter = lambda f, kf=keep_folds: f is None or f in kf
+                else:
+                    if len(val_fold) != 1 or len(test_fold) != 1:
+                        raise ValueError("need just one --val_fold and one --test_fold value for augmentation_source=train")
+                    held_out = {canonical_fold(val_fold[0]), canonical_fold(test_fold[0])}
+                    fold_filter = lambda f, ho=held_out: f is None or f not in ho
             else:
-                if len(test_fold) != 1:
-                    raise ValueError(f"need just one --test_fold value for augmentation, got {args.test_fold!r}")
-                source_fold = canonical_fold(test_fold[0])
+                if args.augmentation_source == "test":
+                    if len(test_fold) != 1:
+                        raise ValueError(f"need just one --test_fold value for augmentation, got {args.test_fold!r}")
+                    source_folds = [canonical_fold(test_fold[0])]
+                else:
+                    if len(val_fold) != 1 or len(test_fold) != 1:
+                        raise ValueError("need just one --val_fold and one --test_fold value for augmentation_source=train")
+                    held_out = {canonical_fold(val_fold[0]), canonical_fold(test_fold[0])}
+                    source_folds = [canonical_fold(f) for f in range(1, args.augmentation_folds + 1) if canonical_fold(f) not in held_out]
                 aug_files = train_augmentation_file_paths(
-                    args.augmentation_dir, source_fold=source_fold,
+                    args.augmentation_dir, source_folds=source_folds,
                     splits=args.augmentation_splits,
                 )
-                fold_filter = lambda f, sf=source_fold: f == sf
-            always_items = [dataset.items[i] for i in train_idx]
+                source_folds_set = set(source_folds)
+                fold_filter = lambda f, sfs=source_folds_set: f in sfs
+            if args.augmentation_only:
+                always_items = []
+                print("augmentation_only is on, real train-fold rows are excluded")
+            else:
+                always_items = [dataset.items[i] for i in train_idx]
             resample_every_epoch = args.augmentation_resample_every_epoch
             if args.augmentation_multiplier == 0:
                 if not resample_every_epoch:
@@ -123,6 +176,7 @@ def main():
             train_set = AugmentedTrainDataset(
                 always_items, aug_files, n_aug_per_epoch, hp,
                 fold_filter=fold_filter,
+                smiles_exclude=smiles_exclude,
                 shuffle_buffer=args.shuffle_buffer,
                 resample_every_epoch=resample_every_epoch,
             )

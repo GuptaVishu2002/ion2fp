@@ -25,5 +25,7 @@ augmentation_multiplier=$(echo $line | cut -d ' ' -f 3)
 
 python train.py --input /Genomics/skinniderlab/msms-triangulation/spectra/benchmark/releases/spectraverse-1.0.2.mgf \
     --augmentation_multiplier ${augmentation_multiplier} \
+    --augmentation_candidates /Genomics/skinniderlab/msms-triangulation/candidates/spectraverse102/spectraverse102_candidates_formula.json \
     --output_dir runs/sv102_augx${augmentation_multiplier}/split${test_fold} --val_fold ${val_fold} --test_fold ${test_fold} \
-    --num_workers 31 --augmentation_resample_every_epoch n
+    --num_workers 31 --augmentation_resample_every_epoch n --augmentation_source test --augmentation_exclude none --augmentation_only n
+    

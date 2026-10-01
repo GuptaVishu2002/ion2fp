@@ -151,18 +151,44 @@ class SpectrumFingerprintDataset(Dataset):
 
 
 class AugmentedTrainDataset(IterableDataset):
-    def __init__(self, always_items, aug_paths, n_aug_per_epoch, hp, fold_filter=None, shuffle_buffer=0, resample_every_epoch=True):
+    def __init__(self, always_items, aug_paths, n_aug_per_epoch, hp, fold_filter=None, smiles_exclude=None, shuffle_buffer=0, resample_every_epoch=True):
         self.always_items = list(always_items)
         self.aug_paths = [Path(p) for p in aug_paths]
         self.n_aug_per_epoch = n_aug_per_epoch
         self.hp = hp
         self.fold_filter = fold_filter
+        self.smiles_exclude = smiles_exclude
         self.shuffle_buffer = shuffle_buffer
         self.max_n_ions = hp.padded_max_n_ions()
         if n_aug_per_epoch is None and not resample_every_epoch:
             raise ValueError("can't cache the full augmentation pool, need resample_every_epoch=True for that")
         self.resample_every_epoch = resample_every_epoch
         self._cached_augmented = None
+
+        if n_aug_per_epoch is not None:
+            available = self._count_available(n_aug_per_epoch)
+            print(f"counted {available} usable augmented spectra against a requested {n_aug_per_epoch}")
+            if available < n_aug_per_epoch:
+                print(f"only {available} augmented spectra pass the filter, capping to that instead of {n_aug_per_epoch} (no duplicates)")
+            self.n_aug_per_epoch = available
+
+    def _count_available(self, cap):
+        count = 0
+        fingerprint_cache = {}
+        for path in self.aug_paths:
+            for i, spec in enumerate(load_from_mgf(str(path))):
+                if not self._passes_prefilter(spec):
+                    continue
+                item = _spectrum_to_item(
+                    spec, self.hp, self.max_n_ions, True, f"{path.name}:{i}",
+                    fingerprint_cache=fingerprint_cache,
+                )
+                if item is None:
+                    continue
+                count += 1
+                if count >= cap:
+                    return cap
+        return count
 
     def __len__(self):
         if self.n_aug_per_epoch is None:
@@ -188,19 +214,29 @@ class AugmentedTrainDataset(IterableDataset):
             return list(self.aug_paths)
         return self.aug_paths[worker_info.id::worker_info.num_workers]
 
+    def _passes_prefilter(self, spec):
+        if self.fold_filter is not None:
+            raw_fold = spec.get("fold")
+            fold = canonical_fold(raw_fold) if raw_fold is not None else None
+            if not self.fold_filter(fold):
+                return False
+        if self.smiles_exclude is not None and spec.get("smiles") in self.smiles_exclude:
+            return False
+        return True
+
     def _iter_full_pool(self):
         fingerprint_cache = {}
         paths = self._files_for_this_worker()
         random.shuffle(paths)
         for path in paths:
             for i, spec in enumerate(load_from_mgf(str(path))):
+                if not self._passes_prefilter(spec):
+                    continue
                 item = _spectrum_to_item(
                     spec, self.hp, self.max_n_ions, True, f"{path.name}:{i}",
                     fingerprint_cache=fingerprint_cache,
                 )
                 if item is None:
-                    continue
-                if self.fold_filter is not None and not self.fold_filter(item["fold"]):
                     continue
                 yield item
 
@@ -214,30 +250,52 @@ class AugmentedTrainDataset(IterableDataset):
             return
 
         fingerprint_cache = {}
+        paths = list(self.aug_paths)
+        random.shuffle(paths)
         yielded = 0
-        while yielded < target:
-            paths = list(self.aug_paths)
-            random.shuffle(paths)
-            yielded_this_pass = 0
-            for path in paths:
+        for path in paths:
+            if yielded >= target:
+                break
+            for i, spec in enumerate(load_from_mgf(str(path))):
                 if yielded >= target:
                     break
-                for i, spec in enumerate(load_from_mgf(str(path))):
+                if not self._passes_prefilter(spec):
+                    continue
+                item = _spectrum_to_item(
+                    spec, self.hp, self.max_n_ions, True, f"{path.name}:{i}",
+                    fingerprint_cache=fingerprint_cache,
+                )
+                if item is None:
+                    continue
+                yield item
+                yielded += 1
+        if yielded < target:
+            worker_info = get_worker_info()
+            worker_desc = f"worker {worker_info.id}/{worker_info.num_workers}" if worker_info is not None else "no workers"
+            print(f"[{worker_desc}] SHORTFALL: only yielded {yielded}/{target} augmented items after reading the whole pool once, topping up with a reread", flush=True)
+            while yielded < target:
+                paths = list(self.aug_paths)
+                random.shuffle(paths)
+                yielded_this_pass = 0
+                for path in paths:
                     if yielded >= target:
                         break
-                    item = _spectrum_to_item(
-                        spec, self.hp, self.max_n_ions, True, f"{path.name}:{i}",
-                        fingerprint_cache=fingerprint_cache,
-                    )
-                    if item is None:
-                        continue
-                    if self.fold_filter is not None and not self.fold_filter(item["fold"]):
-                        continue
-                    yield item
-                    yielded += 1
-                    yielded_this_pass += 1
-            if yielded_this_pass == 0:
-                break
+                    for i, spec in enumerate(load_from_mgf(str(path))):
+                        if yielded >= target:
+                            break
+                        if not self._passes_prefilter(spec):
+                            continue
+                        item = _spectrum_to_item(
+                            spec, self.hp, self.max_n_ions, True, f"{path.name}:{i}",
+                            fingerprint_cache=fingerprint_cache,
+                        )
+                        if item is None:
+                            continue
+                        yield item
+                        yielded += 1
+                        yielded_this_pass += 1
+                if yielded_this_pass == 0:
+                    break
 
     def _augmented_items_for_this_epoch(self):
         if self.resample_every_epoch:
@@ -310,15 +368,16 @@ def filter_by_fold(dataset, folds):
     return dataset
 
 
-def train_augmentation_file_paths(augmentation_dir, source_fold, splits=10):
+def train_augmentation_file_paths(augmentation_dir, source_folds, splits=10):
     augmentation_dir = Path(augmentation_dir)
-    source_fold = canonical_fold(source_fold)
+    source_folds = [canonical_fold(f) for f in source_folds]
     paths = []
     for split_count in range(1, splits + 1):
-        path = augmentation_dir / f"fragnnet_split{split_count}_fold{source_fold}.mgf"
-        if not path.is_file():
-            raise FileNotFoundError(f"can't find augmentation file {path}")
-        paths.append(path)
+        for source_fold in source_folds:
+            path = augmentation_dir / f"fragnnet_split{split_count}_fold{source_fold}.mgf"
+            if not path.is_file():
+                raise FileNotFoundError(f"can't find augmentation file {path}")
+            paths.append(path)
     return paths
 
 
